@@ -19,7 +19,6 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"math/rand"
 	"os"
 	"os/exec"
 	"runtime/debug"
@@ -206,7 +205,7 @@ OSDs; rather, the least busy target OSDs and PGs will be selected.
 	}
 
 	undoUpmapsCmd = &cobra.Command{
-		Use:   "undo-upmaps <osdspec> [<osdspec> ...]",
+		Use:   "undo-upmaps --sources [<osdspec> ...] --targets [<osdspec> ...]",
 		Short: "Undo upmap entries for the given source/target OSDs",
 		Long: `Undo upmap entries for the given source/target OSDs.
 
@@ -221,37 +220,24 @@ performing a swap-bucket where we want the source OSDs to totally drain (vs.
 balance with the rest of the cluster). It also achieves a much higher level of
 concurrency than the balancer generally will.
 `,
-		Args: func(cmd *cobra.Command, args []string) error {
-			if len(args) < 1 {
-				return errors.New("at least one OSD must be specified")
-			}
-
-			for _, arg := range args {
-				if _, err := parseOsdSpec(arg); err != nil {
-					return err
-				}
-			}
-
-			return nil
-		},
 		Run: func(cmd *cobra.Command, args []string) {
 			M = mustGetCurrentMappingState()
+			targets := mustGetOsdSpecSlice(cmd, "targets")
+			sources := mustGetOsdSpecSlice(cmd, "sources")
 
-			osds := make([]int, 0, len(args))
-			for _, arg := range args {
-				osdSpecOsds := mustParseOsdSpec(arg)
-				osds = append(osds, osdSpecOsds...)
+			if len(targets) == 0 && len(sources) == 0 {
+				panic("must specify at least one source or target")
 			}
 
-			// Randomize OSD list for fairness across multiple
-			// runs.
-			rand.Shuffle(len(osds), func(i, j int) { osds[i], osds[j] = osds[j], osds[i] })
+			// // Randomize OSD list for fairness across multiple
+			// // runs.
+			// rand.Shuffle(len(osds), func(i, j int) { osds[i], osds[j] = osds[j], osds[i] })
+			// rand.Shuffle(len(osds), func(i, j int) { osds[i], osds[j] = osds[j], osds[i] })
 
-			target := mustGetBool(cmd, "target")
 			mustParseMaxBackfillReservations(cmd)
 			mustParseMaxSourceBackfills(cmd)
 
-			calcPgMappingsToUndoUpmaps(osds, target)
+			calcPgMappingsToUndoUpmaps(sources, targets)
 			if !confirmProceed() {
 				return
 			}
@@ -717,8 +703,9 @@ func init() {
 	rootCmd.AddCommand(drainCmd)
 
 	undoUpmapsCmd.Flags().StringSlice("max-backfill-reservations", []string{}, "limit number of backfill reservations made; format: \"default max[,osdspec:max]\", e.g., \"5,bucket:data10:10\"")
+	undoUpmapsCmd.Flags().StringSlice("sources", []string{}, "list of sources to include")
+	undoUpmapsCmd.Flags().StringSlice("targets", []string{}, "list of targets to include")
 	undoUpmapsCmd.Flags().Int("max-source-backfills", 1, "max number of backfills to schedule per source OSD, including pre-existing ones")
-	undoUpmapsCmd.Flags().Bool("target", false, "the given OSDs are backfill targets rather than sources")
 	rootCmd.AddCommand(undoUpmapsCmd)
 
 	rootCmd.AddCommand(remapCmd)
@@ -988,35 +975,47 @@ func isCandidateMapping(
 	return true
 }
 
-func calcPgMappingsToUndoUpmaps(osds []int, osdsAreTargets bool) {
+func calcPgMappingsToUndoUpmaps(sources []int, targets []int) {
 	// For fairness, iterate the osds, adding one backfill at a time to
 	// each candidate, until we don't add any new backfills.
 	somethingChanged := true
 	for somethingChanged {
 		somethingChanged = false
 
-		for _, osd := range osds {
-			var candidateMappings []pgMapping
-			if osdsAreTargets {
-				candidateMappings = M.getMappings(withFrom(osd))
-			} else {
-				candidateMappings = M.getMappings(withTo(osd))
-			}
-
-			// Since we pass these mappings in as candidates for
-			// action, reverse the From and To (since we want to
-			// undo the associated upmap).
-			for i := range candidateMappings {
-				mp := &candidateMappings[i].Mapping
-				mp.From, mp.To = mp.To, mp.From
-			}
-
-			_, ok := remapLeastBusyPg(candidateMappings)
-			if !ok {
-				continue
-			}
-			somethingChanged = true
+		target_filters := make([]mappingFilter, 0)
+		for _, target := range targets {
+			target_filters = append(target_filters, withFrom(target))
 		}
+		source_filters := make([]mappingFilter, 0)
+		for _, source := range sources {
+			source_filters = append(source_filters, withTo(source))
+		}
+
+		var filter mappingFilter
+		if len(target_filters) == 0 {
+		  filter = mfOr(source_filters...)
+		} else if len(source_filters) == 0 {
+		  filter = mfOr(target_filters...)			
+		} else {
+		  filter = mfAnd(mfOr(target_filters...), mfOr(source_filters...))
+		}
+
+		var candidateMappings []pgMapping
+		candidateMappings = M.getMappings(filter)
+
+		// Since we pass these mappings in as candidates for
+		// action, reverse the From and To (since we want to
+		// undo the associated upmap).
+		for i := range candidateMappings {
+			mp := &candidateMappings[i].Mapping
+			mp.From, mp.To = mp.To, mp.From
+		}
+
+		_, ok := remapLeastBusyPg(candidateMappings)
+		if !ok {
+			continue
+		}
+		somethingChanged = true
 	}
 }
 
